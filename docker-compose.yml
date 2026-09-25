@@ -1,0 +1,11 @@
+services:
+  top10arr:
+    build: .
+    container_name: netflix-top10arr
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/data
+    # Sonarr/Radarr aynı compose ağındaysa URL'lerde servis adını kullanın
+    # (ör. http://sonarr:8989). Farklı bir ağdaysa o ağa ekleyin:
+    # networks: [arr]
