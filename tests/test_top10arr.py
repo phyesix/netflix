@@ -1,3 +1,4 @@
+import gzip
 import json
 import os
 import sys
@@ -81,6 +82,82 @@ class CronTests(unittest.TestCase):
         for expr in ("* * * *", "60 * * * *", "* * * * 8", "*/0 * * * *", "a * * * *"):
             with self.assertRaises(ValueError):
                 top10arr.CronSchedule(expr)
+
+
+class FlakyFile(BaseHTTPRequestHandler):
+    """Serves PAYLOAD; the first response is cut off halfway through."""
+    payload = b""
+    gzip = False
+    requests = []
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        body = self.payload
+        use_gzip = self.gzip and "gzip" in (self.headers.get("Accept-Encoding") or "")
+        if use_gzip:
+            body = gzip.compress(body, mtime=0)
+        rng = self.headers.get("Range")
+        FlakyFile.requests.append(rng)
+        if rng:
+            start = int(rng.split("=")[1].rstrip("-"))
+            self.send_response(206)
+            part = body[start:]
+            self.send_header("Content-Range", f"bytes {start}-{len(body) - 1}/{len(body)}")
+        else:
+            self.send_response(200)
+            part = body
+        self.send_header("Content-Length", str(len(part)))
+        if use_gzip:
+            self.send_header("Content-Encoding", "gzip")
+        self.end_headers()
+        if len(FlakyFile.requests) == 1:
+            self.wfile.write(part[: len(part) // 2])  # drop the connection early
+        else:
+            self.wfile.write(part)
+
+
+class DownloadTests(unittest.TestCase):
+    def setUp(self):
+        FlakyFile.requests = []
+        FlakyFile.payload = TSV.encode() * 200
+        self.server = HTTPServer(("127.0.0.1", 0), FlakyFile)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_port}/top10.tsv"
+        self.sleep = top10arr.time.sleep
+        top10arr.time.sleep = lambda s: None
+
+    def tearDown(self):
+        top10arr.time.sleep = self.sleep
+        self.server.shutdown()
+        self.server.server_close()
+
+    def test_resumes_after_cut(self):
+        FlakyFile.gzip = False
+        self.assertEqual(top10arr.download(self.url), FlakyFile.payload)
+        self.assertEqual(len(FlakyFile.requests), 2)
+        self.assertEqual(FlakyFile.requests[1], f"bytes={len(FlakyFile.payload) // 2}-")
+
+    def test_gzip_resume(self):
+        FlakyFile.gzip = True
+        self.assertEqual(top10arr.download(self.url), FlakyFile.payload)
+        self.assertEqual(len(FlakyFile.requests), 2)
+        self.assertIsNotNone(FlakyFile.requests[1])
+
+    def test_gives_up(self):
+        FlakyFile.gzip = False
+        orig = FlakyFile.do_GET
+
+        def always_cut(handler):
+            FlakyFile.requests.clear()
+            orig(handler)
+        FlakyFile.do_GET = always_cut
+        try:
+            with self.assertRaises(Exception):
+                top10arr.download(self.url, attempts=2)
+        finally:
+            FlakyFile.do_GET = orig
 
 
 class FakeArr(BaseHTTPRequestHandler):

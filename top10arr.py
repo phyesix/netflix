@@ -9,6 +9,8 @@ Radarr. Only the Python standard library is used.
 from __future__ import annotations
 
 import csv
+import gzip
+import http.client
 import io
 import json
 import logging
@@ -189,9 +191,61 @@ def parse_top10(tsv_text: str, country: str, weeks: int, max_rank: int) -> list[
     return sorted(entries.values(), key=lambda e: (e.kind, e.rank))
 
 
+def download(url: str, attempts: int = 5, timeout: int = 120) -> bytes:
+    """Download a large file robustly.
+
+    Asks for gzip to shrink the ~30 MB TSV, and when the connection drops
+    mid-transfer resumes with an HTTP Range request instead of starting over.
+    """
+    buf = bytearray()
+    encoding = None
+    expected = None
+    for attempt in range(1, attempts + 1):
+        req = urllib.request.Request(url)
+        req.add_header("User-Agent", USER_AGENT)
+        req.add_header("Accept-Encoding", "gzip")
+        if buf:
+            req.add_header("Range", f"bytes={len(buf)}-")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status = getattr(resp, "status", None) or 200
+                resp_encoding = (resp.headers.get("Content-Encoding") or "").lower() or None
+                if status != 206 or resp_encoding != encoding:
+                    # Fresh (full) response: server ignored Range or changed encoding.
+                    buf.clear()
+                    encoding = resp_encoding
+                    length = resp.headers.get("Content-Length")
+                    expected = int(length) if length and length.isdigit() else None
+                while True:
+                    try:
+                        chunk = resp.read(1 << 16)
+                    except http.client.IncompleteRead as e:
+                        buf += e.partial
+                        raise
+                    if not chunk:
+                        break
+                    buf += chunk
+            if expected is not None and len(buf) < expected:
+                raise http.client.IncompleteRead(b"", expected - len(buf))
+            data = bytes(buf)
+            return gzip.decompress(data) if encoding == "gzip" else data
+        except (http.client.HTTPException, urllib.error.URLError, OSError) as e:
+            if isinstance(e, urllib.error.HTTPError) and e.code == 416:
+                buf.clear()  # our partial data no longer matches: restart
+            if attempt == attempts:
+                raise
+            wait = min(2 ** attempt, 30)
+            log.warning("İndirme kesildi (%s, %d bayt alındı); %d sn sonra %s (deneme %d/%d)",
+                        type(e).__name__, len(buf), wait,
+                        "kaldığı yerden devam edilecek" if buf else "tekrar denenecek",
+                        attempt + 1, attempts)
+            time.sleep(wait)
+    raise RuntimeError("unreachable")
+
+
 def fetch_top10(cfg: Config) -> list[Top10Entry]:
     log.info("Netflix Top 10 verisi indiriliyor: %s", cfg.top10_url)
-    text = http_request(cfg.top10_url, timeout=120).decode("utf-8")
+    text = download(cfg.top10_url).decode("utf-8-sig")
     entries = parse_top10(text, cfg.country, cfg.weeks, cfg.max_rank)
     if entries:
         log.info("%s için %d içerik bulundu (hafta: %s)", cfg.country, len(entries),
