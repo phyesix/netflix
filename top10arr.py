@@ -21,7 +21,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 log = logging.getLogger("top10arr")
 
@@ -77,6 +78,9 @@ class Config:
     state_file: str
     dry_run: bool
     interval_hours: float
+    cron_schedule: str | None
+    timezone: str
+    run_on_start: bool
     sonarr: ArrConfig | None
     radarr: ArrConfig | None
 
@@ -113,6 +117,9 @@ class Config:
             state_file=env("STATE_FILE", "state.json"),
             dry_run=env_bool("DRY_RUN", False),
             interval_hours=float(env("INTERVAL_HOURS", "0")),
+            cron_schedule=env("CRON_SCHEDULE"),
+            timezone=env("TZ", "Europe/Istanbul"),
+            run_on_start=env_bool("RUN_ON_START", True),
             sonarr=sonarr,
             radarr=radarr,
         )
@@ -417,24 +424,116 @@ def run_once(cfg: Config) -> dict[str, int]:
     return stats
 
 
+# --------------------------------------------------------------------------- #
+# Built-in cron scheduler
+# --------------------------------------------------------------------------- #
+class CronSchedule:
+    """Minimal 5-field cron expression (minute hour day month weekday).
+
+    Supports `*`, numbers, ranges (`1-5`), lists (`1,3`) and steps (`*/6`,
+    `0-30/10`). Weekday 0 and 7 are Sunday. As in classic cron, when both day
+    and weekday are restricted a match on either one is enough.
+    """
+
+    RANGES = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)]
+
+    def __init__(self, expr: str):
+        fields = expr.split()
+        if len(fields) != 5:
+            raise ValueError(f"Geçersiz cron ifadesi (5 alan olmalı): {expr!r}")
+        self.expr = expr
+        parsed = [self._parse(f, lo, hi) for f, (lo, hi) in zip(fields, self.RANGES)]
+        self.minutes, self.hours, self.days, self.months, weekdays = parsed
+        self.weekdays = {d % 7 for d in weekdays}
+        self.day_any = fields[2] == "*"
+        self.weekday_any = fields[4] == "*"
+
+    @staticmethod
+    def _parse(field: str, lo: int, hi: int) -> set[int]:
+        values: set[int] = set()
+        for part in field.split(","):
+            rng, _, step = part.partition("/")
+            if rng == "*":
+                start, end = lo, hi
+            elif "-" in rng:
+                start, end = (int(x) for x in rng.split("-", 1))
+            else:
+                start = int(rng)
+                end = hi if step else start
+            step_n = int(step) if step else 1
+            if not (lo <= start <= end <= hi) or step_n < 1:
+                raise ValueError(f"Geçersiz cron alanı: {field!r}")
+            values.update(range(start, end + 1, step_n))
+        return values
+
+    def _day_matches(self, dt: datetime) -> bool:
+        day_ok = dt.day in self.days
+        weekday_ok = (dt.isoweekday() % 7) in self.weekdays
+        if self.day_any or self.weekday_any:
+            return day_ok and weekday_ok
+        return day_ok or weekday_ok
+
+    def next_after(self, dt: datetime) -> datetime:
+        """First matching minute strictly after `dt` (keeps dt's tzinfo)."""
+        t = dt.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        limit = t + timedelta(days=366 * 5)
+        while t < limit:
+            if t.month not in self.months or not self._day_matches(t):
+                t = (t + timedelta(days=1)).replace(hour=0, minute=0)
+            elif t.hour not in self.hours:
+                t = (t + timedelta(hours=1)).replace(minute=0)
+            elif t.minute not in self.minutes:
+                t += timedelta(minutes=1)
+            else:
+                return t
+        raise ValueError(f"Cron ifadesi hiç eşleşmiyor: {self.expr!r}")
+
+
+def sleep_until(target: datetime) -> None:
+    while True:
+        remaining = (target - datetime.now(target.tzinfo)).total_seconds()
+        if remaining <= 0:
+            return
+        time.sleep(min(remaining, 300))
+
+
+def safe_run(cfg: Config) -> bool:
+    try:
+        run_once(cfg)
+        return True
+    except Exception:  # keep the daemon alive, retry on the next schedule
+        log.exception("Çalıştırma başarısız")
+        return False
+
+
 def main() -> int:
     logging.basicConfig(level=env("LOG_LEVEL", "INFO").upper(),
                         format="%(asctime)s %(levelname)s %(message)s")
     cfg = Config.from_env()
+    log.info("top10arr %s başlıyor (ülke: %s)", env("APP_VERSION", "dev"), cfg.country)
     if not cfg.sonarr and not cfg.radarr:
         log.warning("SONARR_URL/SONARR_API_KEY veya RADARR_URL/RADARR_API_KEY tanımlı değil; "
                     "sadece liste gösterilecek")
-    while True:
-        try:
-            run_once(cfg)
-        except Exception:  # keep the daemon alive, retry on the next interval
-            log.exception("Çalıştırma başarısız")
-            if cfg.interval_hours <= 0:
-                return 1
-        if cfg.interval_hours <= 0:
-            return 0
-        log.info("%.1f saat sonra tekrar çalışacak", cfg.interval_hours)
-        time.sleep(cfg.interval_hours * 3600)
+
+    if cfg.cron_schedule:
+        tz = ZoneInfo(cfg.timezone)
+        schedule = CronSchedule(cfg.cron_schedule)
+        log.info("Cron modu: '%s' (%s)", schedule.expr, cfg.timezone)
+        if cfg.run_on_start:
+            safe_run(cfg)
+        while True:
+            next_run = schedule.next_after(datetime.now(tz))
+            log.info("Sonraki çalışma: %s", next_run.strftime("%Y-%m-%d %H:%M %Z"))
+            sleep_until(next_run)
+            safe_run(cfg)
+
+    if cfg.interval_hours > 0:
+        while True:
+            safe_run(cfg)
+            log.info("%.1f saat sonra tekrar çalışacak", cfg.interval_hours)
+            time.sleep(cfg.interval_hours * 3600)
+
+    return 0 if safe_run(cfg) else 1
 
 
 if __name__ == "__main__":

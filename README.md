@@ -1,8 +1,8 @@
 # Netflix Türkiye Top 10 → Sonarr / Radarr
 
 Netflix'in resmi haftalık **Top 10** verisini (Tudum) takip eder, Türkiye listesindeki
-**dizileri Sonarr'a**, **filmleri Radarr'a** otomatik ekler. Sürekli çalışır (varsayılan
-12 saatte bir kontrol) ve daha önce eklenenleri tekrar denemez.
+**dizileri Sonarr'a**, **filmleri Radarr'a** otomatik ekler. Dahili cron ile sürekli çalışır
+(varsayılan 6 saatte bir) ve daha önce eklenenleri tekrar denemez.
 
 ## Nasıl çalışır?
 
@@ -18,39 +18,65 @@ Netflix'in resmi haftalık **Top 10** verisini (Tudum) takip eder, Türkiye list
    isterseniz hemen aramayı başlatır.
 5. Sonuç `state.json` içine yazılır; eklenen/var olan içerikler sonraki çalışmalarda atlanır.
 
-## Kurulum (Docker – önerilen)
+## Kurulum (homelab – hazır Docker imajı)
+
+`master`'a gelen her commit'te GitHub Actions testleri çalıştırır, imajı
+`ghcr.io/phyesix/netflix` adresine (amd64, arm64, arm/v7 — Raspberry Pi dahil) yükler ve
+`v1.0.N` sürümüyle bir GitHub release oluşturur. Etiketler: `latest`, `1.0.N`, `sha-<commit>`.
+
+Zamanlama konteynerin **içinde** (dahili cron) yapılır; host'ta cron kurmanız gerekmez.
 
 ```bash
-git clone https://github.com/phyesix/netflix.git && cd netflix
-cp .env.example .env
+mkdir -p ~/homelab/netflix-top10 && cd ~/homelab/netflix-top10
+curl -fsSLO https://raw.githubusercontent.com/phyesix/netflix/master/docker-compose.yml
+curl -fsSL -o .env https://raw.githubusercontent.com/phyesix/netflix/master/.env.example
 # .env içinde SONARR_API_KEY / RADARR_API_KEY ve URL'leri doldurun
 # (API anahtarı: Sonarr/Radarr → Settings → General → Security → API Key)
 mkdir -p data && sudo chown 1000:1000 data
 
-# Önce deneme: hiçbir şey eklemeden ne yapacağını görün
-docker compose run --rm -e DRY_RUN=true -e INTERVAL_HOURS=0 top10arr
+# Önce deneme: hiçbir şey eklemeden ne yapacağını görün (tek sefer çalışır)
+docker compose run --rm -e DRY_RUN=true -e CRON_SCHEDULE= top10arr
 
-# Sonra sürekli çalışır halde başlatın
-docker compose up -d --build
+# Sürekli çalışır halde başlatın
+docker compose up -d
 docker compose logs -f
 ```
+
+Tek komutla `docker run` isterseniz:
+
+```bash
+docker run -d --name netflix-top10arr --restart unless-stopped \
+  --env-file .env -v "$PWD/data:/data" ghcr.io/phyesix/netflix:latest
+```
+
+Güncellemek için `docker compose pull && docker compose up -d` (veya Watchtower).
+Belirli bir sürüme sabitlemek için `image: ghcr.io/phyesix/netflix:1.0.N` kullanın.
 
 Sonarr/Radarr başka bir Docker ağındaysa `docker-compose.yml`'daki `networks` satırını açıp
 o ağı ekleyin ya da URL'lerde sunucunun IP'sini kullanın (ör. `http://192.168.1.10:8989`).
 
-## Kurulum (Docker'sız / cron)
+> Paket ilk yayınlandığında GHCR'de **private** olabilir. Şifresiz `docker pull` için
+> GitHub → profil → Packages → `netflix` → Package settings → *Change visibility → Public*.
 
-Python 3.9+ yeterli, ek paket gerekmez.
+## Zamanlama
+
+| Değişken | Varsayılan | Açıklama |
+|---|---|---|
+| `CRON_SCHEDULE` | `17 */6 * * *` | 5 alanlı cron ifadesi (dakika saat gün ay haftanın-günü). `*`, `1-5`, `1,3`, `*/6` desteklenir |
+| `TZ` | `Europe/Istanbul` | Cron ifadesinin yorumlandığı saat dilimi |
+| `RUN_ON_START` | `true` | Konteyner açılınca hemen bir kez çalış |
+
+`CRON_SCHEDULE` boşsa `INTERVAL_HOURS` (saat cinsinden aralık) kullanılır; o da `0` ise
+program bir kez çalışıp çıkar.
+
+## Docker'sız çalıştırma
+
+Python 3.9+ yeterli, ek paket gerekmez. Dahili cron burada da çalışır:
 
 ```bash
 set -a; . ./.env; set +a
-INTERVAL_HOURS=0 python3 top10arr.py
-```
-
-crontab örneği (her gün 10:17'de):
-
-```
-17 10 * * * cd /opt/netflix && set -a && . ./.env && set +a && INTERVAL_HOURS=0 STATE_FILE=/opt/netflix/data/state.json python3 top10arr.py >> top10arr.log 2>&1
+python3 top10arr.py              # CRON_SCHEDULE'a göre sürekli çalışır
+CRON_SCHEDULE= python3 top10arr.py   # tek sefer
 ```
 
 ## Ayarlar
@@ -68,7 +94,6 @@ Tüm ayarlar ortam değişkeniyle verilir, açıklamalar için `.env.example` do
 | `*_SEARCH` | `true` | Eklerken indirme aramasını başlat |
 | `*_TAGS` | – | Eklenen içeriklere etiket (yoksa oluşturulur) — sonradan filtrelemek/temizlemek için faydalı |
 | `DRY_RUN` | `false` | Sadece logla, ekleme yapma |
-| `INTERVAL_HOURS` | `12` (Docker) | Kontrol aralığı; `0` tek sefer çalışır |
 
 Sonarr veya Radarr'dan sadece biri tanımlıysa diğer türdeki içerikler atlanır.
 

@@ -1,6 +1,6 @@
 services:
   top10arr:
-    build: .
+    image: ghcr.io/phyesix/netflix:latest
     container_name: netflix-top10arr
     restart: unless-stopped
     env_file: .env

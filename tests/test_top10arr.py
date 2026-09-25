@@ -4,8 +4,10 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import top10arr  # noqa: E402
@@ -46,6 +48,39 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(top10arr.best_match("Heat", results)["year"], 2025)
         self.assertEqual(top10arr.best_match("Nope", results)["title"], "Something Else")
         self.assertIsNone(top10arr.best_match("x", []))
+
+
+class CronTests(unittest.TestCase):
+    TZ = ZoneInfo("Europe/Istanbul")
+
+    def at(self, *args):
+        return datetime(*args, tzinfo=self.TZ)
+
+    def test_daily(self):
+        c = top10arr.CronSchedule("17 10 * * *")
+        self.assertEqual(c.next_after(self.at(2026, 9, 25, 9, 0)), self.at(2026, 9, 25, 10, 17))
+        self.assertEqual(c.next_after(self.at(2026, 9, 25, 10, 17)), self.at(2026, 9, 26, 10, 17))
+
+    def test_steps_ranges_lists(self):
+        c = top10arr.CronSchedule("0 */6 * * *")
+        self.assertEqual(c.next_after(self.at(2026, 9, 25, 6, 30)), self.at(2026, 9, 25, 12, 0))
+        c = top10arr.CronSchedule("30 9,21 * * 1-5")
+        # 2026-09-26 is a Saturday -> next is Monday 09:30
+        self.assertEqual(c.next_after(self.at(2026, 9, 25, 22, 0)), self.at(2026, 9, 28, 9, 30))
+
+    def test_weekday_seven_is_sunday(self):
+        c = top10arr.CronSchedule("0 12 * * 7")
+        self.assertEqual(c.next_after(self.at(2026, 9, 25, 0, 0)), self.at(2026, 9, 27, 12, 0))
+
+    def test_day_or_weekday(self):
+        c = top10arr.CronSchedule("0 0 1 * 3")  # 1st of month OR Wednesday
+        self.assertEqual(c.next_after(self.at(2026, 9, 25, 0, 0)), self.at(2026, 9, 30, 0, 0))
+        self.assertEqual(c.next_after(self.at(2026, 9, 30, 0, 0)), self.at(2026, 10, 1, 0, 0))
+
+    def test_invalid(self):
+        for expr in ("* * * *", "60 * * * *", "* * * * 8", "*/0 * * * *", "a * * * *"):
+            with self.assertRaises(ValueError):
+                top10arr.CronSchedule(expr)
 
 
 class FakeArr(BaseHTTPRequestHandler):
@@ -103,7 +138,8 @@ class SyncTests(unittest.TestCase):
         self.cfg = top10arr.Config(
             country="TR", top10_url="file://" + self.tsv, weeks=1, max_rank=10,
             exclude=[], state_file=os.path.join(self.tmp.name, "state.json"),
-            dry_run=False, interval_hours=0,
+            dry_run=False, interval_hours=0, cron_schedule=None,
+            timezone="Europe/Istanbul", run_on_start=True,
             sonarr=top10arr.ArrConfig(base, "key", None, None, ["netflix-tr"], True, monitor="all"),
             radarr=top10arr.ArrConfig(base, "key", "HD-1080p", "/media", [], False,
                                       minimum_availability="released"))
